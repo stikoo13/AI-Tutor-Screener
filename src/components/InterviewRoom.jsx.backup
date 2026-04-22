@@ -1,0 +1,283 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react'
+import { speakText } from '../utils/groqService'
+import {
+  PHASE1_QUESTIONS, GOOD_STUDENT_SCRIPT, BAD_STUDENT_SCRIPT,
+  QUIZ_QUESTIONS, isTooShort, scoreResponse
+} from '../utils/interviewScript'
+import { generateAssessment } from '../utils/assessmentEngine'
+import PhaseHeader from './PhaseHeader'
+import VoiceOrb    from './VoiceOrb'
+import QuizPhase   from './QuizPhase'
+import FinalReport from './FinalReport'
+import Transcript  from './Transcript'
+
+const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition
+
+export default function InterviewRoom({ candidate, onFinish }) {
+  const [ready, setReady]           = useState(false)
+  const [phase, setPhase]           = useState(1)
+  const [subPhase, setSubPhase]     = useState(null)
+  const [orbState, setOrb]          = useState('idle')
+  const [uiMode, setUiMode]         = useState('idle')
+  const [transcript, setTx]         = useState([])
+  const [error, setError]           = useState('')
+  const [p1Index, setP1Index]       = useState(0)
+  const [p1Answers, setP1Answers]   = useState([])
+  const [awaitingFollowUp, setFollowUp] = useState(false)
+  const [p2Index, setP2Index]       = useState(0)
+  const [quizResult, setQuizResult] = useState(null)
+  const [assessment, setAssessment] = useState(null)
+  const [isListening, setIsListening] = useState(false)
+  const [liveText, setLiveText]     = useState('')
+
+  const recognitionRef = useRef(null)
+  const isProcessing   = useRef(false)
+  const phaseRef       = useRef(1)
+  const p1IndexRef     = useRef(0)
+  const p1AnswersRef   = useRef([])
+  const awaitingRef    = useRef(false)
+  const subPhaseRef    = useRef(null)
+  const p2IndexRef     = useRef(0)
+  const finalTextRef   = useRef('')
+
+  useEffect(() => { phaseRef.current     = phase },            [phase])
+  useEffect(() => { p1IndexRef.current   = p1Index },         [p1Index])
+  useEffect(() => { p1AnswersRef.current = p1Answers },       [p1Answers])
+  useEffect(() => { awaitingRef.current  = awaitingFollowUp },[awaitingFollowUp])
+  useEffect(() => { subPhaseRef.current  = subPhase },        [subPhase])
+  useEffect(() => { p2IndexRef.current   = p2Index },         [p2Index])
+
+  const addMsg = useCallback((role, text) =>
+    setTx(t => [...t, { role, text }]), [])
+
+  const openMic = useCallback(() => {
+    if (!SpeechRecognition) {
+      setError('Use Chrome browser for speech recognition')
+      return
+    }
+    if (recognitionRef.current) {
+      try { recognitionRef.current.abort() } catch(e) {}
+    }
+    const recognition = new SpeechRecognition()
+    recognition.lang = 'en-US'
+    recognition.continuous = true
+    recognition.interimResults = true
+    finalTextRef.current = ''
+
+    recognition.onstart = () => {
+      setIsListening(true)
+      setUiMode('listening')
+      setOrb('listening')
+      setLiveText('')
+    }
+
+    recognition.onresult = (e) => {
+      let interim = ''
+      let final = ''
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) final += e.results[i][0].transcript
+        else interim += e.results[i][0].transcript
+      }
+      if (final) finalTextRef.current += ' ' + final
+      setLiveText((finalTextRef.current + ' ' + interim).trim())
+    }
+
+    recognition.onerror = (e) => {
+      if (e.error === 'no-speech') setLiveText('No speech detected, please speak...')
+    }
+
+    recognition.onend = () => { setIsListening(false) }
+
+    recognitionRef.current = recognition
+    recognition.start()
+  }, [])
+
+  const processText = useCallback(async (text) => {
+    if (isProcessing.current) return
+    if (!text || !text.trim()) { openMic(); return }
+    isProcessing.current = true
+    setUiMode('processing')
+    setOrb('idle')
+    setError('')
+    setLiveText('')
+    addMsg('candidate', text)
+    try {
+      if (phaseRef.current === 1) await handleP1Answer(text)
+      if (phaseRef.current === 2) await handleP2Answer()
+    } catch(e) {
+      console.error(e)
+      setError('Something went wrong, please try again')
+      openMic()
+    }
+    isProcessing.current = false
+  }, [])
+
+  const handleDone = useCallback(() => {
+    if (recognitionRef.current) {
+      try { recognitionRef.current.stop() } catch(e) {}
+    }
+    setIsListening(false)
+    const text = finalTextRef.current.trim()
+    processText(text)
+  }, [processText])
+
+  const speak = useCallback(async (text, role = 'ai') => {
+    setUiMode('ai-speaking')
+    setOrb('ai-speaking')
+    addMsg(role, text)
+    await speakText(text)
+    await new Promise(r => setTimeout(r, 300))
+    openMic()
+  }, [addMsg, openMic])
+
+  const askP1 = useCallback(async (idx) => {
+    if (idx >= PHASE1_QUESTIONS.length) {
+      await speak("That wraps up the first section. Let's move to the teaching simulation.")
+      setPhase(2); phaseRef.current = 2
+      setSubPhase('good'); subPhaseRef.current = 'good'
+      setP2Index(0); p2IndexRef.current = 0
+      addMsg('good', GOOD_STUDENT_SCRIPT[0].text)
+      await speakText(GOOD_STUDENT_SCRIPT[0].text)
+      openMic()
+      return
+    }
+    await speak(PHASE1_QUESTIONS[idx].question)
+  }, [speak, addMsg, openMic])
+
+  const handleP1Answer = useCallback(async (text) => {
+    const idx   = p1IndexRef.current
+    const q     = PHASE1_QUESTIONS[idx]
+    const score = scoreResponse(text, q)
+    if (!awaitingRef.current && (isTooShort(text) || score < 4)) {
+      setFollowUp(true)
+      await speak(q.followUp)
+      return
+    }
+    const updated = [...p1AnswersRef.current]
+    updated[idx]  = { answer: text, score }
+    p1AnswersRef.current = updated
+    setP1Answers(updated)
+    setFollowUp(false)
+    const next = idx + 1
+    setP1Index(next); p1IndexRef.current = next
+    await askP1(next)
+  }, [speak, askP1])
+
+  const handleP2Answer = useCallback(async () => {
+    const sp     = subPhaseRef.current
+    const script = sp === 'good' ? GOOD_STUDENT_SCRIPT : BAD_STUDENT_SCRIPT
+    const next   = p2IndexRef.current + 1
+    if (next >= script.length) {
+      if (sp === 'good') {
+        setSubPhase('bad'); subPhaseRef.current = 'bad'
+        setP2Index(0);      p2IndexRef.current  = 0
+        addMsg('bad', BAD_STUDENT_SCRIPT[0].text)
+        await speakText(BAD_STUDENT_SCRIPT[0].text)
+        openMic()
+      } else {
+        setPhase(3); phaseRef.current = 3
+        setUiMode('idle'); setOrb('idle')
+        speechSynthesis.cancel()
+      }
+    } else {
+      setP2Index(next); p2IndexRef.current = next
+      addMsg(sp, script[next].text)
+      await speakText(script[next].text)
+      openMic()
+    }
+  }, [addMsg, openMic])
+
+  const handleStart = useCallback(async () => {
+    setReady(true)
+    const warmup = new SpeechSynthesisUtterance(' ')
+    warmup.volume = 0
+    speechSynthesis.speak(warmup)
+    await new Promise(r => setTimeout(r, 400))
+    await speak(
+      `Hi ${candidate?.fullName || 'there'}, I'm Maya. ` +
+      `Welcome to your Cuemath tutor screening. ` +
+      `I'll ask you a few questions. Just speak naturally after I finish. ` +
+      `Let's begin.`
+    )
+    await speak(PHASE1_QUESTIONS[0].question)
+  }, [speak, candidate])
+
+  const handleQuizDone = (result) => {
+    setQuizResult(result)
+    const a = generateAssessment(p1AnswersRef.current, result.score, result.total)
+    setAssessment(a)
+    setPhase(4)
+  }
+
+  if (phase === 4 && assessment) {
+    return (
+      <FinalReport
+        assessment={assessment}
+        quizResult={quizResult}
+        candidateName={candidate?.fullName}
+        onRestart={onFinish}
+      />
+    )
+  }
+
+  const subLabel = subPhase === 'good' ? 'Aryan' : subPhase === 'bad' ? 'Riya' : null
+
+  if (!ready) {
+    return (
+      <div style={S.gatePage}>
+        <div style={S.gateCard}>
+          <div style={S.gateOrb}>✦</div>
+          <h2 style={S.gateTitle}>Ready to begin?</h2>
+          <p style={S.gateSub}>
+            Find a quiet place.<br />
+            Maya will speak first — your mic opens automatically after she finishes.
+          </p>
+          <button style={S.gateBtn} onClick={handleStart}>
+            Start Interview
+          </button>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div style={S.page}>
+      <PhaseHeader phase={phase} subLabel={subLabel} />
+      {phase < 3 && (
+        <div style={S.center}>
+          <VoiceOrb state={orbState} audioLevel={isListening ? 0.5 : 0} />
+          {uiMode === 'listening'   && <p style={S.greenLabel}>● Listening</p>}
+          {uiMode === 'processing'  && <p style={S.greyLabel}>Thinking…</p>}
+          {uiMode === 'ai-speaking' && <p style={S.greyLabel}>Maya is speaking…</p>}
+          {liveText ? <p style={S.liveText}>"{liveText}"</p> : null}
+          {uiMode === 'listening' && (
+            <button style={S.doneBtn} onClick={handleDone}>
+              Done talking
+            </button>
+          )}
+          {error && <p style={S.errorTxt}>{error}</p>}
+        </div>
+      )}
+      {phase === 3 && (
+        <QuizPhase questions={QUIZ_QUESTIONS} onComplete={handleQuizDone} />
+      )}
+      {transcript.length > 0 && <Transcript transcript={transcript} />}
+    </div>
+  )
+}
+
+const S = {
+  page:       { minHeight:'100vh', display:'flex', flexDirection:'column', background:'var(--bg)' },
+  center:     { flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:20, padding:'40px 24px' },
+  greenLabel: { fontSize:14, color:'#43e97b', letterSpacing:'0.05em', margin:0 },
+  greyLabel:  { fontSize:14, color:'var(--text-3)', margin:0 },
+  liveText:   { fontSize:15, color:'var(--text-2)', fontStyle:'italic', maxWidth:500, textAlign:'center', minHeight:24 },
+  doneBtn:    { background:'transparent', border:'1px solid var(--border)', borderRadius:20, padding:'8px 20px', fontSize:13, color:'var(--text-3)', cursor:'pointer', marginTop:4 },
+  errorTxt:   { color:'#ff6b6b', fontSize:13, marginTop:8, textAlign:'center', maxWidth:400 },
+  gatePage:   { minHeight:'100vh', display:'flex', alignItems:'center', justifyContent:'center', background:'var(--bg)', padding:24 },
+  gateCard:   { background:'var(--bg-2)', border:'1px solid var(--border)', borderRadius:24, padding:'48px 40px', maxWidth:420, width:'100%', display:'flex', flexDirection:'column', alignItems:'center', gap:16, textAlign:'center', boxShadow:'var(--shadow-lg)' },
+  gateOrb:    { width:72, height:72, borderRadius:'50%', background:'linear-gradient(135deg,#6c63ff,#8b5cf6)', display:'flex', alignItems:'center', justifyContent:'center', fontSize:32, color:'white', boxShadow:'0 4px 24px rgba(108,99,255,0.4)' },
+  gateTitle:  { fontSize:26, fontFamily:'var(--font-display)', fontWeight:400, margin:0, color:'var(--text)' },
+  gateSub:    { fontSize:15, color:'var(--text-2)', lineHeight:1.7, margin:0 },
+  gateBtn:    { marginTop:8, background:'linear-gradient(135deg,#6c63ff,#8b5cf6)', color:'white', border:'none', borderRadius:12, padding:'14px 36px', fontSize:16, fontWeight:600, cursor:'pointer', boxShadow:'0 4px 20px rgba(108,99,255,0.4)' }
+}
