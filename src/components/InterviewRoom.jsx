@@ -1,4 +1,3 @@
-cat > src/components/InterviewRoom.jsx << 'ENDOFFILE'
 import React, { useState, useRef, useCallback } from 'react'
 import { speakText, askMaya } from '../utils/groqService'
 import { QUIZ_QUESTIONS } from '../utils/interviewScript'
@@ -48,7 +47,7 @@ export default function InterviewRoom({ candidate, onFinish }) {
   const [assessment, setAssessment] = useState(null)
   const [liveText, setLiveText]     = useState('')
   const [textInput, setTextInput]   = useState('')
-  const [inputMode, setInputMode]   = useState('voice')
+  const [inputMode, setInputMode]   = useState('text')
 
   const recRef      = useRef(null)
   const finalBuf    = useRef('')
@@ -72,14 +71,17 @@ export default function InterviewRoom({ candidate, onFinish }) {
     try { r.abort() } catch(_) {}
   }, [])
 
-  const openMic = useCallback(() => {
-    if (!SR || inputMode === 'text') {
+  const openMic = useCallback((forceMode) => {
+    const mode = forceMode || inputMode
+    if (!SR || mode === 'text') {
       setUiMode('listening'); setOrb('listening'); return
     }
     killRec()
     finalBuf.current = ''; interimBuf.current = ''
     const r = new SR()
-    r.lang = 'en-US'; r.continuous = true; r.interimResults = true
+    r.lang = 'en-US'
+    r.continuous = false
+    r.interimResults = true
     recRef.current = r
     r.onstart = () => { setUiMode('listening'); setOrb('listening'); setLiveText('') }
     r.onresult = (e) => {
@@ -93,12 +95,17 @@ export default function InterviewRoom({ candidate, onFinish }) {
       setLiveText((finalBuf.current + int).trim())
     }
     r.onerror = (ev) => {
-      if (ev.error === 'not-allowed' || ev.error === 'service-not-allowed') {
-        setInputMode('text'); setUiMode('listening'); setOrb('listening')
-        setError('Mic blocked — type your answer below')
+      console.warn('SR error:', ev.error)
+      setInputMode('text')
+      setUiMode('listening'); setOrb('listening')
+      setError('Mic issue — type your answer below instead')
+    }
+    r.onend = () => {
+      const text = (finalBuf.current + ' ' + interimBuf.current).trim()
+      if (text && !processing.current) {
+        submitAnswerRef.current(text)
       }
     }
-    r.onend = () => {}
     try { r.start() } catch(e) {
       setInputMode('text'); setUiMode('listening'); setOrb('listening')
       setError('Mic unavailable — type your answer below')
@@ -162,7 +169,8 @@ export default function InterviewRoom({ candidate, onFinish }) {
     }
   }, [speak, addMsg, openMic, killRec])
 
-  const submitAnswer = useCallback((text) => {
+  const submitAnswerRef = useRef(null)
+  submitAnswerRef.current = (text) => {
     if (processing.current) return
     const trimmed = text.trim()
     if (!trimmed) { setError('Please speak or type your answer first'); return }
@@ -183,27 +191,25 @@ export default function InterviewRoom({ candidate, onFinish }) {
       processing.current = false
     }
     run()
-  }, [killRec, addMsg, handleP1Answer, handleP2Answer, openMic])
+  }
 
-  const handleDone = useCallback(() => {
+  const handleDone = () => {
     const text = (finalBuf.current + ' ' + interimBuf.current).trim()
-    submitAnswer(text)
-  }, [submitAnswer])
+    submitAnswerRef.current(text)
+  }
 
-  const handleTextSend = useCallback(() => {
-    submitAnswer(textInput)
-  }, [submitAnswer, textInput])
+  const handleTextSend = () => { submitAnswerRef.current(textInput) }
 
-  const handleKeyDown = useCallback((e) => {
+  const handleKeyDown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleTextSend() }
-  }, [handleTextSend])
+  }
 
   const handleStart = useCallback(async () => {
     setReady(true)
     const warm = new SpeechSynthesisUtterance(' ')
     warm.volume = 0; speechSynthesis.speak(warm)
     await new Promise(r => setTimeout(r, 500))
-    const opening = `Hi ${candidate?.fullName || 'there'}, I am Maya, your interviewer from Cuemath. It is great to meet you! I will be asking you a few questions to understand your teaching style and experience. Just speak naturally after I finish each question. Let us begin — could you start by telling me why you want to teach math to children?`
+    const opening = `Hi ${candidate?.fullName || 'there'}, I am Maya, your interviewer from Cuemath. It is great to meet you! I will ask you a few questions to understand your teaching style and experience. Just answer after I finish each question. Let us begin — why do you want to teach math to children?`
     historyRef.current = [{ role: 'assistant', content: opening }]
     await speak(opening, 'ai')
   }, [speak, candidate])
@@ -222,7 +228,7 @@ export default function InterviewRoom({ candidate, onFinish }) {
       <div style={S.gateCard}>
         <div style={S.gateOrb}>✦</div>
         <h2 style={S.gateTitle}>Ready to begin?</h2>
-        <p style={S.gateSub}>Find a quiet place.<br />Maya will speak first — your mic opens automatically after she finishes.</p>
+        <p style={S.gateSub}>Find a quiet place. Maya will speak first, then you respond.</p>
         <button style={S.gateBtn} onClick={handleStart}>Start Interview</button>
       </div>
     </div>
@@ -236,17 +242,21 @@ export default function InterviewRoom({ candidate, onFinish }) {
       {phase < 3 && (
         <div style={S.center}>
           <VoiceOrb state={orbState} audioLevel={isListening ? 0.5 : 0} />
-          {uiMode === 'listening'   && inputMode === 'voice' && <p style={S.greenLabel}>● Listening — speak now</p>}
+
+          {uiMode === 'listening'   && inputMode === 'voice' && <p style={S.greenLabel}>● Listening — speak now (auto-submits when you stop)</p>}
           {uiMode === 'listening'   && inputMode === 'text'  && <p style={S.greenLabel}>● Type your answer below</p>}
           {uiMode === 'processing'  && <p style={S.greyLabel}>⏳ Maya is thinking…</p>}
           {uiMode === 'ai-speaking' && <p style={S.greyLabel}>🔊 Maya is speaking…</p>}
+
           {inputMode === 'voice' && liveText ? <p style={S.liveText}>"{liveText}"</p> : null}
+
           {isListening && inputMode === 'voice' && (
             <div style={S.voiceControls}>
               <button style={S.doneBtn} onClick={handleDone}>✓ Done Talking</button>
-              <button style={S.switchBtn} onClick={() => { setInputMode('text'); setError('') }}>⌨ Type instead</button>
+              <button style={S.switchBtn} onClick={() => { killRec(); setInputMode('text'); setUiMode('listening'); setOrb('listening'); setError('') }}>⌨ Type instead</button>
             </div>
           )}
+
           {isListening && inputMode === 'text' && (
             <div style={S.textBox}>
               <textarea
@@ -255,15 +265,22 @@ export default function InterviewRoom({ candidate, onFinish }) {
                 value={textInput}
                 onChange={e => setTextInput(e.target.value)}
                 onKeyDown={handleKeyDown}
-                rows={3}
+                rows={4}
                 autoFocus
               />
               <div style={S.textActions}>
                 <button style={S.sendBtn} onClick={handleTextSend} disabled={!textInput.trim()}>Send ➜</button>
-                {SR && <button style={S.switchBtn} onClick={() => { setInputMode('voice'); setError(''); openMic() }}>🎤 Use mic</button>}
+                {SR && (
+                  <button style={S.switchBtn} onClick={() => {
+                    setInputMode('voice')
+                    setError('')
+                    openMic('voice')
+                  }}>🎤 Use mic</button>
+                )}
               </div>
             </div>
           )}
+
           {error && <p style={S.errorTxt}>{error}</p>}
         </div>
       )}
@@ -294,4 +311,3 @@ const S = {
   gateSub:      { fontSize:15, color:'var(--text-2)', lineHeight:1.7, margin:0 },
   gateBtn:      { marginTop:8, background:'linear-gradient(135deg,#6c63ff,#8b5cf6)', color:'white', border:'none', borderRadius:12, padding:'14px 36px', fontSize:16, fontWeight:600, cursor:'pointer', boxShadow:'0 4px 20px rgba(108,99,255,0.4)' },
 }
-ENDOFFILE
